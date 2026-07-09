@@ -1,93 +1,143 @@
 #!/usr/bin/env python3
 """
 Single-shot poller: checks the eJewishPhilanthropy WordPress API for newly
-published posts and sends each new article's URL to Slack, letting Slack unfurl
-it into a preview card. Runs once per invocation from the GitHub Actions pinger
-(see .github/workflows/poll.yml) — no loop, no sleep.
+published posts and sends each new article's URL to Slack (Slack unfurls it).
+Runs once per invocation from the GitHub Actions pinger.
 
-State (the IDs already posted) lives in watcher_state.json, which the workflow
-commits back to the repo after each run so the next run remembers what it sent.
+Double-post safety (runs can overlap when GitHub is slow):
+- Right before posting each article, re-read the freshest "already posted" list
+  straight from the repo (origin/main) and skip anything a concurrent run has
+  already handled.
+- Commit + push each post immediately (merging with origin, retrying on a race)
+  so the other run sees it right away.
+Net effect: two overlapping runs won't post the same article twice.
 
-Reads the Slack webhook from the SLACK_WEBHOOK_URL environment variable, which
-the workflow supplies from a repository secret.
+Reads SLACK_WEBHOOK_URL from env (a repo secret). No third-party deps (stdlib
+only) so runs are fast, which also minimizes overlap.
 """
 
 import json
 import os
+import subprocess
 from pathlib import Path
-
-import requests
+from urllib.request import Request, urlopen
 
 WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
-
 API_URL = (
     "https://ejewishphilanthropy.com/wp-json/wp/v2/posts"
     "?per_page=20&orderby=date&order=desc&_fields=id,link"
 )
 STATE_FILE = Path(__file__).parent / "watcher_state.json"
-USER_AGENT = (
+REPO = STATE_FILE.parent
+UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 )
+GIT_ID = [
+    "-c", "user.name=github-actions[bot]",
+    "-c", "user.email=github-actions[bot]@users.noreply.github.com",
+]
+
+
+def _get_json(url):
+    with urlopen(Request(url, headers={"User-Agent": UA}), timeout=30) as r:
+        return json.loads(r.read().decode())
 
 
 def fetch_posts():
-    resp = requests.get(API_URL, headers={"User-Agent": USER_AGENT}, timeout=30)
-    resp.raise_for_status()
-    return [{"id": p["id"], "link": p.get("link", "")} for p in resp.json()]
+    return [{"id": p["id"], "link": p.get("link", "")} for p in _get_json(API_URL)]
+
+
+def _parse(text):
+    try:
+        return set(json.loads(text))
+    except Exception:
+        return set()
 
 
 def load_seen():
-    if STATE_FILE.exists():
-        return set(json.loads(STATE_FILE.read_text()))
-    return set()
+    return _parse(STATE_FILE.read_text()) if STATE_FILE.exists() else set()
 
 
 def save_seen(seen):
     STATE_FILE.write_text(json.dumps(sorted(seen, reverse=True)[:500]))
 
 
-def post_to_slack(text):
-    # unfurl_links/unfurl_media=True so a bare article URL expands into Slack's
-    # own preview card — without it, bot/webhook messages don't unfurl links.
-    resp = requests.post(
-        WEBHOOK_URL,
-        json={"text": text, "unfurl_links": True, "unfurl_media": True},
-        timeout=15,
+def git(*args):
+    return subprocess.run(
+        ["git", "-C", str(REPO), *args], capture_output=True, text=True, timeout=30
     )
-    resp.raise_for_status()
+
+
+def latest_seen():
+    """Freshest committed state from origin — so we don't repost what another run just did."""
+    git("fetch", "-q", "origin", "main")
+    r = git("show", "origin/main:watcher_state.json")
+    return _parse(r.stdout) if r.returncode == 0 else load_seen()
+
+
+def record(seen):
+    """Push the state as the union of ours + origin's; retry on a concurrent-push race."""
+    for _ in range(5):
+        git("fetch", "-q", "origin", "main")
+        remote = git("show", "origin/main:watcher_state.json")
+        merged = seen | (_parse(remote.stdout) if remote.returncode == 0 else set())
+        git("reset", "-q", "--hard", "origin/main")
+        save_seen(merged)
+        git("add", "watcher_state.json")
+        if git("diff", "--cached", "--quiet").returncode == 0:
+            return  # origin already has everything we do
+        git(*GIT_ID, "commit", "-q", "-m", "Update watcher state [skip ci]")
+        if git("push", "-q", "origin", "HEAD:main").returncode == 0:
+            return
+        # push lost the race — loop, re-merge against the new origin, try again
+
+
+def post_to_slack(text):
+    body = json.dumps(
+        {"text": text, "unfurl_links": True, "unfurl_media": True}
+    ).encode()
+    urlopen(
+        Request(WEBHOOK_URL, data=body, headers={"Content-Type": "application/json"}),
+        timeout=15,
+    ).read()
 
 
 def main():
     if not WEBHOOK_URL:
-        # Not configured yet — clean no-op so scheduled runs don't error.
         print("SLACK_WEBHOOK_URL not set yet — nothing to do.")
         return
 
-    seen = load_seen()
     posts = fetch_posts()
-    new_posts = [p for p in posts if p["id"] not in seen]
 
     if not STATE_FILE.exists():
-        # First ever run — baseline silently, just say hello once.
-        save_seen({p["id"] for p in posts})
+        # First ever run — baseline silently, say hello once.
+        seen = {p["id"] for p in posts}
+        save_seen(seen)
         post_to_slack(
-            ":eyes: eJewishPhilanthropy article watcher is live (running 24/7 "
-            "on GitHub Actions). New posts will appear here as they publish."
+            ":eyes: eJewishPhilanthropy article watcher is live. New posts will "
+            "appear here as they publish."
         )
+        record(seen)
         print(f"First run — baseline of {len(posts)} posts saved.")
         return
 
+    new_posts = [p for p in posts if p["id"] not in latest_seen()]
     if not new_posts:
         print(f"No new posts ({len(posts)} on feed).")
         return
 
-    # Oldest-first so Slack reads in publish order.
-    for post in reversed(new_posts):
+    posted = 0
+    for post in reversed(new_posts):  # oldest first
+        seen = latest_seen()  # re-check the freshest list right before posting
+        if post["id"] in seen:
+            continue  # a concurrent run already posted it
         post_to_slack(post["link"])
         seen.add(post["id"])
-    save_seen(seen)
-    print(f"Posted {len(new_posts)} new article(s).")
+        save_seen(seen)
+        record(seen)  # record immediately so the other run sees it
+        posted += 1
+    print(f"Posted {posted} new article(s).")
 
 
 if __name__ == "__main__":

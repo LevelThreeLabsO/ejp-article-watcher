@@ -1,0 +1,51 @@
+name: Daily Phil WhatsApp post
+
+# Weekdays: wait for today's Your Daily Phil, build the WhatsApp post
+# (title + first 3 headlines verbatim + plain eJP link), DM it to Sruli on Slack.
+# Normally started by poll.yml (the 2-min pinger) from 9am ET; GitHub's own
+# schedule below is only a backup, because it runs late or skips.
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Post again even if today's already went out"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "30 14 * * 1-5"
+    # Watchdog: if nothing ran by ~4:30pm ET, this posts with a "Late" warning.
+    - cron: "30 21 * * 1-5"
+
+permissions:
+  actions: read
+
+concurrency:
+  group: dailyphil
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 420
+    steps:
+      # A finished run today (posted, or posted a warning) means nothing to do.
+      - name: Skip if today's run already finished
+        id: done
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TZ: America/New_York
+        run: |
+          today=$(date +%F)
+          n=$(gh run list -R "$GITHUB_REPOSITORY" --workflow dailyphil.yml \
+                --limit 10 --json databaseId,createdAt,conclusion \
+                -q "[.[] | select(.databaseId != $GITHUB_RUN_ID) | select(.conclusion==\"success\" or .conclusion==\"failure\") | select(.createdAt | fromdateiso8601 | strflocaltime(\"%F\") == \"$today\")] | length" \
+              || echo 0)
+          echo "already=$([ "${n:-0}" -gt 0 ] && echo yes || echo no)" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
+      - uses: actions/checkout@v4
+        if: steps.done.outputs.already != 'yes' || inputs.force
+      - run: python3 dailyphil_post.py
+        if: steps.done.outputs.already != 'yes' || inputs.force
+        env:
+          TZ: America/New_York
+          DM_SLACK_WEBHOOK: ${{ secrets.DM_SLACK_WEBHOOK }}

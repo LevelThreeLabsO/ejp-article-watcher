@@ -10,6 +10,7 @@ on:
 # Needed so poll.py can commit the updated state file back to the repo.
 permissions:
   contents: write
+  actions: write   # lets the Daily Phil step below start dailyphil.yml
 
 # One run at a time. poll.py also re-checks the state per-article, so even if two
 # runs overlap they won't post the same article twice.
@@ -25,3 +26,24 @@ jobs:
       - run: python3 poll.py
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      # Weekdays 9am-2pm ET: start the Daily Phil WhatsApp job once a day
+      # (dailyphil.yml waits for the edition). One quick API call per run in
+      # that window; never blocks the watcher.
+      - name: Start Daily Phil WhatsApp job
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 1
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TZ: America/New_York
+        run: |
+          [ "$(date +%u)" -le 5 ] || exit 0
+          hm=$(date +%H%M)
+          { [ "$hm" -ge 900 ] && [ "$hm" -lt 1400 ]; } || exit 0
+          today=$(date +%F)
+          n=$(gh run list -R "$GITHUB_REPOSITORY" --workflow dailyphil.yml --limit 5 \
+                --json createdAt -q "[.[] | select(.createdAt | fromdateiso8601 | strflocaltime(\"%F\") == \"$today\")] | length")
+          if [ "${n:-1}" -eq 0 ]; then
+            gh workflow run dailyphil.yml -R "$GITHUB_REPOSITORY" --ref main
+            echo "Started today's Daily Phil job."
+          fi

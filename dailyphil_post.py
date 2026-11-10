@@ -58,7 +58,7 @@ def verbatim(fragment):
 
 def todays_edition():
     today = datetime.datetime.now(ET).date().isoformat()
-    posts = get_json(f"{API}?search=your%20daily%20phil&per_page=10"
+    posts = get_json(f"{API}?search=your%20daily%20phil&orderby=date&per_page=10"
                      "&_fields=date,link,title,content")
     for p in posts:
         slug = p["link"].rstrip("/").rsplit("/", 1)[-1]

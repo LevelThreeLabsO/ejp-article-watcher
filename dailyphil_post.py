@@ -114,10 +114,6 @@ def main():
     except Exception as e:
         slack(f":warning: Couldn't build today's Daily Phil WhatsApp post: {e}")
         raise
-    if datetime.datetime.now(ET).hour >= 16:
-        post = (":warning: Late: the morning trigger didn't fire, so this came from "
-                "the backup schedule. Check the eJP watcher's cron-job.org pinger.\n\n"
-                + post)
     slack(post)
 
 

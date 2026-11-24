@@ -11,10 +11,6 @@ on:
         description: "Post again even if today's already went out"
         type: boolean
         default: false
-  schedule:
-    - cron: "30 14 * * 1-5"
-    # Watchdog: if nothing ran by ~4:30pm ET, this posts with a "Late" warning.
-    - cron: "30 21 * * 1-5"
 
 permissions:
   actions: read
